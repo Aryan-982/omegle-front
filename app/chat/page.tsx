@@ -1,57 +1,56 @@
 "use client";
 
+import { Suspense, useState, useEffect, useRef } from "react";
 import { useSearchParams } from "next/navigation";
-import { useState, useEffect, useRef } from "react";
 import io from "socket.io-client";
 import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-const socket = io("http://localhost:5000"); // 👈 change if backend on another URL
+// Change this to your production backend
+const socket = io("https://omegle-back-production.up.railway.app");
 
-export default function ChatPage() {
+interface Message {
+  sender: string;
+  text: string;
+}
+
+function ChatContent() {
   const params = useSearchParams();
   const interest = params.get("interest") || "Random";
   const [message, setMessage] = useState("");
-  const [messages, setMessages] = useState<{ sender: string; text: string }[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]); // ✅ typed properly
   const [status, setStatus] = useState("Searching for a partner...");
   const [connected, setConnected] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    // Join room based on interest
-  socket.emit("find_partner", interest);
+    socket.emit("find_partner", interest);
 
-    // Waiting status
-    socket.on("waiting", () => {
-      setStatus("Waiting for another user with same interest...");
-    });
-
-    // Connected to partner
+    socket.on("waiting", () =>
+      setStatus("Waiting for another user with same interest...")
+    );
     socket.on("partner_found", () => {
       setConnected(true);
       setStatus(`Connected! You’re chatting about "${interest}"`);
     });
-
-    // Receive messages
-    socket.on("receive_message", (data) => {
-      // data should be { sender, text }
-      setMessages((prev) => [...prev, { sender: data.sender, text: data.text }]);
+    socket.on("receive_message", (data: Message) => {
+      setMessages((prev) => [...prev, data]);
     });
 
-    // Cleanup on unmount
     return () => {
-  socket.emit("leaveChat");
+      socket.emit("leaveChat");
       socket.off("waiting");
-      socket.off("partnerFound");
-      socket.off("message");
+      socket.off("partner_found");
+      socket.off("receive_message");
     };
   }, [interest]);
 
   const handleSend = () => {
     if (!message.trim()) return;
-    // Send both sender and text to backend
-    socket.emit("send_message", { sender: "me", text: message });
+    const msg: Message = { sender: "me", text: message };
+    socket.emit("send_message", msg);
+    setMessages((prev) => [...prev, msg]);
     setMessage("");
   };
 
@@ -61,7 +60,7 @@ export default function ChatPage() {
 
   return (
     <main className="flex flex-col h-screen bg-gradient-to-br from-[#0C2B4E] via-[#1A3D64] to-[#1D546C] text-white relative overflow-hidden">
-      {/* Animated glowing gradient */}
+      {/* Gradient background */}
       <motion.div
         className="absolute inset-0 opacity-30 bg-[radial-gradient(ellipse_at_top_left,_var(--tw-gradient-stops))] from-[#1D546C] via-transparent to-[#0C2B4E]"
         animate={{ opacity: [0.25, 0.4, 0.25] }}
@@ -133,5 +132,13 @@ export default function ChatPage() {
         </Button>
       </div>
     </main>
+  );
+}
+
+export default function ChatPage() {
+  return (
+    <Suspense fallback={<div className="text-center p-8 text-white">Loading chat...</div>}>
+      <ChatContent />
+    </Suspense>
   );
 }
