@@ -11,8 +11,15 @@ const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
 // In-memory pairing structures
-const waitingUsers: Record<string, string[]> = {}; // { interest: [socketId, ...] }
+interface WaitingUser {
+  socketId: string;
+  interests: string[];
+  joinedAt: number; // timestamp for FIFO when interests match equally
+}
+
+const waitingUsers: WaitingUser[] = []; // Array of waiting users with their interests
 const activePairs: Record<string, string> = {}; // { socketId: partnerSocketId }
+const userInterests: Record<string, string[]> = {}; // { socketId: [interests] }
 
 app.prepare().then(() => {
   const httpServer = createServer(async (req, res) => {
@@ -36,32 +43,110 @@ app.prepare().then(() => {
   io.on("connection", (socket) => {
     console.log("✅ Connected:", socket.id);
 
-    // Client asks to find a partner for an interest
-    socket.on("find_partner", (interest: string) => {
-      if (!interest) interest = "Random";
-      if (!waitingUsers[interest]) waitingUsers[interest] = [];
+    // Helper function to parse interests
+    const parseInterests = (interestInput: string | string[]): string[] => {
+      if (Array.isArray(interestInput)) {
+        return interestInput.filter(i => i && i.trim() !== "");
+      }
+      if (typeof interestInput === "string") {
+        if (interestInput.trim() === "" || interestInput.toLowerCase() === "random") {
+          return ["Random"];
+        }
+        return interestInput
+          .split(",")
+          .map(i => i.trim())
+          .filter(i => i !== "")
+          .map(i => i.toLowerCase());
+      }
+      return ["Random"];
+    };
 
-      // Try to find partner who is waiting (not same socket)
-      const partnerId = waitingUsers[interest].find((id) => id !== socket.id);
+    // Helper function to find common interests
+    const findCommonInterests = (interests1: string[], interests2: string[]): string[] => {
+      return interests1.filter(i => interests2.includes(i));
+    };
 
-      if (partnerId) {
-        // Remove partner from waiting list
-        waitingUsers[interest] = waitingUsers[interest].filter((id) => id !== partnerId);
+    // Helper function to find best matching partner
+    const findBestMatch = (userInterests: string[], excludeSocketId: string): WaitingUser | null => {
+      let bestMatch: WaitingUser | null = null;
+      let maxCommonInterests = 0;
+      let earliestTimestamp = Infinity;
+
+      for (const waitingUser of waitingUsers) {
+        if (waitingUser.socketId === excludeSocketId) continue;
+
+        const common = findCommonInterests(userInterests, waitingUser.interests);
+        const commonCount = common.length;
+
+        // Skip if no common interests (unless both are Random)
+        const bothRandom = 
+          userInterests.includes("random") && waitingUser.interests.includes("random");
+        
+        if (commonCount === 0 && !bothRandom) continue;
+
+        // Prefer user with most common interests
+        if (commonCount > maxCommonInterests) {
+          maxCommonInterests = commonCount;
+          bestMatch = waitingUser;
+          earliestTimestamp = waitingUser.joinedAt;
+        } 
+        // If same number of common interests, prefer earliest joiner (FIFO)
+        else if (commonCount === maxCommonInterests && waitingUser.joinedAt < earliestTimestamp) {
+          bestMatch = waitingUser;
+          earliestTimestamp = waitingUser.joinedAt;
+        }
+      }
+
+      return bestMatch;
+    };
+
+    // Client asks to find a partner for interests
+    socket.on("find_partner", (interestInput: string | string[]) => {
+      // Parse interests
+      const interests = parseInterests(interestInput);
+      userInterests[socket.id] = interests;
+
+      // Remove user from waiting list if already there
+      const existingIndex = waitingUsers.findIndex(u => u.socketId === socket.id);
+      if (existingIndex !== -1) {
+        waitingUsers.splice(existingIndex, 1);
+      }
+
+      // Try to find best matching partner
+      const bestMatch = findBestMatch(interests, socket.id);
+
+      if (bestMatch) {
+        // Remove both users from waiting list
+        const matchIndex = waitingUsers.findIndex(u => u.socketId === bestMatch.socketId);
+        if (matchIndex !== -1) {
+          waitingUsers.splice(matchIndex, 1);
+        }
 
         // Set active pair both ways
-        activePairs[socket.id] = partnerId;
-        activePairs[partnerId] = socket.id;
+        activePairs[socket.id] = bestMatch.socketId;
+        activePairs[bestMatch.socketId] = socket.id;
 
-        io.to(socket.id).emit("partner_found", partnerId);
-        io.to(partnerId).emit("partner_found", socket.id);
+        const commonInterests = findCommonInterests(interests, bestMatch.interests);
+        const commonStr = commonInterests.length > 0 
+          ? commonInterests.join(", ") 
+          : "Random";
 
-        console.log(`🤝 Matched ${socket.id} ↔ ${partnerId}`);
+        io.to(socket.id).emit("partner_found", bestMatch.socketId);
+        io.to(bestMatch.socketId).emit("partner_found", socket.id);
+
+        console.log(`🤝 Matched ${socket.id} ↔ ${bestMatch.socketId} (common: ${commonStr})`);
       } else {
-        // Add to waiting list if not present
-        if (!waitingUsers[interest].includes(socket.id)) {
-          waitingUsers[interest].push(socket.id);
-        }
-        io.to(socket.id).emit("waiting", "Waiting for another user...");
+        // Add to waiting list
+        waitingUsers.push({
+          socketId: socket.id,
+          interests: interests,
+          joinedAt: Date.now()
+        });
+        
+        const interestStr = interests.length > 0 && !interests.includes("random")
+          ? interests.join(", ")
+          : "Random";
+        io.to(socket.id).emit("waiting", `Waiting for someone interested in: ${interestStr}...`);
       }
     });
 
@@ -106,7 +191,7 @@ app.prepare().then(() => {
     });
 
     // User wants to skip current partner
-    socket.on("skip", (interest: string) => {
+    socket.on("skip", (interestInput: string | string[]) => {
       const partnerId = activePairs[socket.id];
       if (partnerId) {
         // Notify partner that they were skipped
@@ -116,33 +201,47 @@ app.prepare().then(() => {
       // Remove from active pairs
       delete activePairs[socket.id];
       
-      // Remove from waiting lists
-      for (const interestKey in waitingUsers) {
-        waitingUsers[interestKey] = waitingUsers[interestKey].filter((id) => id !== socket.id);
+      // Get user's interests (use stored or parse new)
+      const interests = interestInput 
+        ? parseInterests(interestInput) 
+        : (userInterests[socket.id] || ["Random"]);
+      userInterests[socket.id] = interests;
+
+      // Remove from waiting list if present
+      const existingIndex = waitingUsers.findIndex(u => u.socketId === socket.id);
+      if (existingIndex !== -1) {
+        waitingUsers.splice(existingIndex, 1);
       }
-      
+
       // Immediately search for a new partner
-      if (!interest) interest = "Random";
-      if (!waitingUsers[interest]) waitingUsers[interest] = [];
+      const bestMatch = findBestMatch(interests, socket.id);
       
-      const newPartnerId = waitingUsers[interest].find((id) => id !== socket.id);
-      
-      if (newPartnerId) {
+      if (bestMatch) {
         // Found a new partner immediately
-        waitingUsers[interest] = waitingUsers[interest].filter((id) => id !== newPartnerId);
-        activePairs[socket.id] = newPartnerId;
-        activePairs[newPartnerId] = socket.id;
+        const matchIndex = waitingUsers.findIndex(u => u.socketId === bestMatch.socketId);
+        if (matchIndex !== -1) {
+          waitingUsers.splice(matchIndex, 1);
+        }
         
-        io.to(socket.id).emit("partner_found", newPartnerId);
-        io.to(newPartnerId).emit("partner_found", socket.id);
+        activePairs[socket.id] = bestMatch.socketId;
+        activePairs[bestMatch.socketId] = socket.id;
         
-        console.log(`🔄 Skipped and matched ${socket.id} ↔ ${newPartnerId}`);
+        io.to(socket.id).emit("partner_found", bestMatch.socketId);
+        io.to(bestMatch.socketId).emit("partner_found", socket.id);
+        
+        console.log(`🔄 Skipped and matched ${socket.id} ↔ ${bestMatch.socketId}`);
       } else {
         // Add to waiting list
-        if (!waitingUsers[interest].includes(socket.id)) {
-          waitingUsers[interest].push(socket.id);
-        }
-        io.to(socket.id).emit("waiting", "Waiting for another user...");
+        waitingUsers.push({
+          socketId: socket.id,
+          interests: interests,
+          joinedAt: Date.now()
+        });
+        
+        const interestStr = interests.length > 0 && !interests.includes("random")
+          ? interests.join(", ")
+          : "Random";
+        io.to(socket.id).emit("waiting", `Waiting for someone interested in: ${interestStr}...`);
         console.log(`⏭️ Skipped: ${socket.id} waiting for new partner`);
       }
     });
@@ -154,11 +253,13 @@ app.prepare().then(() => {
         io.to(partnerId).emit("partner_disconnected");
         delete activePairs[partnerId];
       }
-      // Remove from waiting lists
-      for (const interest in waitingUsers) {
-        waitingUsers[interest] = waitingUsers[interest].filter((id) => id !== socket.id);
+      // Remove from waiting list
+      const existingIndex = waitingUsers.findIndex(u => u.socketId === socket.id);
+      if (existingIndex !== -1) {
+        waitingUsers.splice(existingIndex, 1);
       }
       delete activePairs[socket.id];
+      delete userInterests[socket.id];
     });
 
     // Handle disconnect
@@ -169,10 +270,13 @@ app.prepare().then(() => {
         io.to(partnerId).emit("partner_disconnected");
         delete activePairs[partnerId];
       }
-      for (const interest in waitingUsers) {
-        waitingUsers[interest] = waitingUsers[interest].filter((id) => id !== socket.id);
+      // Remove from waiting list
+      const existingIndex = waitingUsers.findIndex(u => u.socketId === socket.id);
+      if (existingIndex !== -1) {
+        waitingUsers.splice(existingIndex, 1);
       }
       delete activePairs[socket.id];
+      delete userInterests[socket.id];
     });
   });
 

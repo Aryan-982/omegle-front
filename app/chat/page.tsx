@@ -144,7 +144,9 @@ function ChatContent() {
 
   const handleSkip = () => {
     if (socketRef.current && connected) {
-      socketRef.current.emit("skip", interest);
+      // Parse interests from query (can be comma-separated)
+      const interests = interest.split(",").map(i => i.trim()).filter(i => i !== "");
+      socketRef.current.emit("skip", interests.length > 0 ? interests : ["Random"]);
       setMessages([]);
       setConnected(false);
       setVideoOn(false);
@@ -241,19 +243,24 @@ function ChatContent() {
           }
         }
 
-        if (!stream || (!gotVideo && !gotAudio)) {
-          throw new Error("Could not access any media devices");
+                 if (!stream || (!gotVideo && !gotAudio)) {
+          // Don't throw - just return gracefully and let user know
+          console.warn("No media devices available");
+          setStatus("No camera or microphone found. You can still chat via text!");
+          setCamEnabled(false);
+          setMicOn(false);
+          return; // Exit gracefully without throwing
         }
       } catch (fallbackError: any) {
         console.error("Error getting user media:", fallbackError);
         
-        // Handle specific error cases
+        // Handle specific error cases - don't throw, just inform user
         if (fallbackError.name === 'NotFoundError' || fallbackError.name === 'DevicesNotFoundError') {
-          setStatus("Camera or microphone not found. Please check your devices.");
+          setStatus("Camera or microphone not found. You can still chat via text!");
           setCamEnabled(false);
           setMicOn(false);
         } else if (fallbackError.name === 'NotAllowedError' || fallbackError.name === 'PermissionDeniedError') {
-          setStatus("Camera/microphone permission denied. Please allow access.");
+          setStatus("Camera/microphone permission denied. Please allow access in browser settings.");
           setCamEnabled(false);
           setMicOn(false);
         } else if (fallbackError.name === 'NotReadableError' || fallbackError.name === 'TrackStartError') {
@@ -261,10 +268,13 @@ function ChatContent() {
           setCamEnabled(false);
           setMicOn(false);
         } else {
-          setStatus(`Error accessing media: ${fallbackError.message || 'Unknown error'}`);
+          setStatus(`Media access error. You can still chat via text!`);
+          setCamEnabled(false);
+          setMicOn(false);
         }
         
-        throw fallbackError;
+        // Don't throw - allow app to continue without video/audio
+        return;
       }
     }
 
@@ -337,13 +347,19 @@ function ChatContent() {
   async function startVideo() {
     try {
       await ensureLocalStream();
+      
+      // If ensureLocalStream returns early (no devices), don't proceed
+      if (!localStreamRef.current) {
+        return;
+      }
+      
       if (partnerIdRef.current && localStreamRef.current) {
         // Check if we actually have tracks before starting
         const hasVideoTrack = localStreamRef.current.getVideoTracks().length > 0;
         const hasAudioTrack = localStreamRef.current.getAudioTracks().length > 0;
         
         if (!hasVideoTrack && !hasAudioTrack) {
-          setStatus("No media devices available. Please check your camera and microphone.");
+          setStatus("No media devices available. You can still chat via text!");
           return;
         }
         
@@ -355,11 +371,7 @@ function ChatContent() {
       }
     } catch (err: any) {
       console.error("startVideo error:", err);
-      if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        setStatus("Camera or microphone not found. Video disabled.");
-      } else {
-        setStatus(`Failed to start video: ${err.message}`);
-      }
+      // Don't show error - ensureLocalStream already handled it
       setVideoOn(false);
     }
   }
@@ -508,7 +520,11 @@ function ChatContent() {
       >
         <div className="flex items-center gap-3">
           <span className="animate-pulse text-[#F4F4F4]">💬🎥</span>
-          <div className="tracking-wide">{connected ? `Chatting about "${interest}"` : status}</div>
+          <div className="tracking-wide">
+            {connected 
+              ? `Chatting ${interest !== "Random" ? `about "${interest}"` : "randomly"}` 
+              : status}
+          </div>
         </div>
 
         <div className="flex gap-2 items-center">
